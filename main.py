@@ -67,6 +67,13 @@ ONE_TRADE_PER_MINT = os.getenv("ONE_TRADE_PER_MINT", "true").lower() in ["1", "t
 MIN_AI_SCORE_TO_TRADE = int(os.getenv("MIN_AI_SCORE_TO_TRADE", "7"))
 MIN_AI_SCORE_TO_ALERT = int(os.getenv("MIN_AI_SCORE_TO_ALERT", "6"))
 
+# Experimental tiny-test override:
+# If AI gives score >= MIN_OVERRIDE_SCORE but approve_trade=False,
+# the bot may still open a tiny test trade when this is true.
+# Score 1-3 should still never be traded.
+ALLOW_SCORE_OVERRIDE_FOR_TINY_TEST = os.getenv("ALLOW_SCORE_OVERRIDE_FOR_TINY_TEST", "false").lower() in ["1", "true", "yes", "y"]
+MIN_OVERRIDE_SCORE = int(os.getenv("MIN_OVERRIDE_SCORE", "5"))
+
 ENABLE_PUMPPORTAL_NEW_TOKENS = os.getenv("ENABLE_PUMPPORTAL_NEW_TOKENS", "true").lower() in ["1", "true", "yes", "y"]
 
 # Safety: Pump.fun new-token stream is extremely noisy.
@@ -78,6 +85,11 @@ TRADE_MANAGE_INTERVAL_SECONDS = int(os.getenv("TRADE_MANAGE_INTERVAL_SECONDS", "
 PUMP_RECONNECT_SECONDS = int(os.getenv("PUMP_RECONNECT_SECONDS", "10"))
 
 MAX_ALERTS_PER_HOUR = int(os.getenv("MAX_ALERTS_PER_HOUR", "15"))
+
+# Debug for auto mode: shows why new pump.fun tokens are not traded.
+AUTO_DEBUG_REJECTIONS = os.getenv("AUTO_DEBUG_REJECTIONS", "true").lower() in ["1", "true", "yes", "y"]
+AUTO_DEBUG_MIN_SCORE = int(os.getenv("AUTO_DEBUG_MIN_SCORE", "3"))
+AUTO_DEBUG_MAX_PER_HOUR = int(os.getenv("AUTO_DEBUG_MAX_PER_HOUR", "8"))
 
 AI_TEMPERATURE = float(os.getenv("AI_TEMPERATURE", "0.15"))
 
@@ -111,6 +123,38 @@ SOLANA_ADDRESS_RE = re.compile(r"(?<![A-Za-z0-9])[1-9A-HJ-NP-Za-km-z]{32,44}(?![
 PUMPFUN_LINK_RE = re.compile(r"https?://(?:www\.)?pump\.fun/(?:coin/)?([1-9A-HJ-NP-Za-km-z]{32,44})", re.I)
 
 LAST_HEALTH_ALERT_TS = 0.0
+
+AUTO_STATS = {
+    "started_at": None,
+    "seen": 0,
+    "bad_name": 0,
+    "dex_checked": 0,
+    "ai_checked": 0,
+    "rejected_before_alert": 0,
+    "rejected_trade": 0,
+    "trade_allowed": 0,
+    "buy_attempts": 0,
+    "buy_success": 0,
+    "buy_failed": 0,
+    "last_mint": None,
+    "last_source": None,
+    "last_score": None,
+    "last_approve_trade": None,
+    "last_should_alert": None,
+    "last_reason": None,
+    "last_time": None,
+}
+
+
+def stat_inc(key: str, amount: int = 1) -> None:
+    AUTO_STATS[key] = int(AUTO_STATS.get(key, 0) or 0) + amount
+
+
+def stat_set(**kwargs: Any) -> None:
+    if AUTO_STATS.get("started_at") is None:
+        AUTO_STATS["started_at"] = iso(now_utc())
+    AUTO_STATS.update(kwargs)
+    AUTO_STATS["last_time"] = iso(now_utc())
 
 
 # =========================
@@ -438,7 +482,9 @@ def evaluate_candidate_with_ai(context: Dict[str, Any]) -> Dict[str, Any]:
 - Ти маєш вирішити, чи бот може автоматично зробити tiny test trade.
 - Відхиляй, якщо це схоже на спам, rug, fake, запізнілий сигнал, слабкий catalyst, поганий source, або даних мало.
 - Для live торгівлі потрібен дуже строгий фільтр.
-- Якщо сумніваєшся — approve_trade=false.
+- Якщо score 5-6 і немає явних red flags, можна дозволити approve_trade=true для tiny test trade.
+- Якщо score 1-3 або є scam/rug/fake/red flags — approve_trade=false.
+- Якщо сумніваєшся і даних зовсім мало — approve_trade=false.
 
 Дані:
 {json.dumps(context, ensure_ascii=False, indent=2)}
@@ -598,6 +644,88 @@ async def send_progress(application: Application, chat_id: Optional[str], text: 
         logger.warning("Could not send progress message: %s", e)
 
 
+async def send_auto_debug_rejection(
+    application: Application,
+    mint: str,
+    source_type: str,
+    reason: str,
+    ai: Optional[Dict[str, Any]] = None,
+    dex_summary: Optional[Dict[str, Any]] = None,
+) -> None:
+    """
+    Sends limited debug messages for auto-mode rejected tokens.
+    This is intentionally rate-limited, so Telegram will not be spammed.
+    """
+    if not AUTO_DEBUG_REJECTIONS:
+        return
+
+    if source_type not in ["pump_new_token", "x_rss_call"]:
+        return
+
+    ai = ai or {}
+    dex_summary = dex_summary or {}
+
+    score = int(ai.get("score", 0) or 0)
+    if score < AUTO_DEBUG_MIN_SCORE:
+        return
+
+    users = get_alert_users()
+    for user in users:
+        telegram_id = str(user["telegram_id"])
+
+        # Separate cap for debug rejections.
+        cutoff = iso(now_utc() - timedelta(hours=1))
+        try:
+            existing = (
+                supabase.table("sent_alerts")
+                .select("id")
+                .eq("telegram_id", telegram_id)
+                .eq("alert_type", "debug_reject")
+                .gte("created_at", cutoff)
+                .execute()
+            )
+            if len(existing.data or []) >= AUTO_DEBUG_MAX_PER_HOUR:
+                continue
+        except Exception:
+            pass
+
+        text = f"""
+👀 <b>Auto debug: token rejected</b>
+
+Mint:
+<code>{escape(mint)}</code>
+
+Source: {escape(source_type)}
+Reason: {escape(reason)}
+
+AI:
+score: {escape(ai.get("score"))}/10
+should_alert: {escape(ai.get("should_alert"))}
+approve_trade: {escape(ai.get("approve_trade"))}
+category: {escape(ai.get("category"))}
+
+Dex:
+price: {escape(dex_summary.get("price_usd"))}
+liquidity: {escape(dex_summary.get("liquidity_usd"))}
+fdv: {escape(dex_summary.get("fdv"))}
+vol 5m: {escape(dex_summary.get("volume_5m"))}
+tx 5m: {escape((dex_summary.get("txns_5m") or {}).get("buys"))} buys / {escape((dex_summary.get("txns_5m") or {}).get("sells"))} sells
+
+AI note:
+{escape(ai.get("why_trade_test") or ai.get("summary_uk"))}
+"""
+        try:
+            await application.bot.send_message(
+                chat_id=telegram_id,
+                text=text.strip(),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            mark_alert_sent(telegram_id, mint, "debug_reject", {"reason": reason, "ai": ai, "dex": dex_summary})
+        except Exception as e:
+            logger.warning("Could not send auto debug rejection: %s", e)
+
+
 # =========================
 # FORMAT
 # =========================
@@ -632,6 +760,7 @@ Tx: {escape(short_addr(trade_result.get("signature") or ""))}
 🧠 <b>AI score:</b> {escape(ai.get("score"))}/10
 🎯 <b>Confidence:</b> {escape(ai.get("confidence"))}/10
 📌 <b>Category:</b> {escape(ai.get("category"))}
+🧪 <b>Override mode:</b> {escape(ALLOW_SCORE_OVERRIDE_FOR_TINY_TEST)} / min {escape(MIN_OVERRIDE_SCORE)}
 
 🪙 <b>Mint:</b>
 <code>{escape(mint)}</code>
@@ -683,15 +812,26 @@ async def process_candidate(application: Application, mint: str, source_type: st
     if not mint:
         return 0
 
+    is_auto_source = source_type in ["pump_new_token", "x_rss_call"]
+    if is_auto_source:
+        stat_inc("seen")
+        stat_set(last_mint=mint, last_source=source_type, last_reason="seen")
+
     await send_progress(application, progress_chat_id, "🔍 <b>1/5</b> Прийняв mint, починаю перевірку...")
     store_detected_token(mint, source_type, source_payload)
 
     if contains_bad_name(json.dumps(source_payload, ensure_ascii=False)):
+        if is_auto_source:
+            stat_inc("bad_name")
+            stat_set(last_mint=mint, last_source=source_type, last_reason="bad name keyword")
         return 0
 
     await send_progress(application, progress_chat_id, "📊 <b>2/5</b> Перевіряю DexScreener...")
     pairs = await asyncio.wait_for(asyncio.to_thread(fetch_dexscreener_token, mint), timeout=10)
     dex_summary = summarize_dex_pairs(pairs)
+    if is_auto_source:
+        stat_inc("dex_checked")
+        stat_set(last_mint=mint, last_source=source_type, last_reason="dex checked")
 
     await send_progress(application, progress_chat_id, "🤖 <b>3/5</b> Відправляю дані в Groq AI...")
     context = {
@@ -705,6 +845,16 @@ async def process_candidate(application: Application, mint: str, source_type: st
     }
 
     ai = await asyncio.wait_for(asyncio.to_thread(evaluate_candidate_with_ai, context), timeout=30)
+    if is_auto_source:
+        stat_inc("ai_checked")
+        stat_set(
+            last_mint=mint,
+            last_source=source_type,
+            last_score=ai.get("score"),
+            last_approve_trade=ai.get("approve_trade"),
+            last_should_alert=ai.get("should_alert"),
+            last_reason=ai.get("why_trade_test") or ai.get("summary_uk") or "ai checked",
+        )
 
     await send_progress(
         application,
@@ -714,6 +864,14 @@ async def process_candidate(application: Application, mint: str, source_type: st
 
     if not force:
         if not ai.get("should_alert") or int(ai.get("score", 0)) < MIN_AI_SCORE_TO_ALERT:
+            reason = (
+                f"before alert filter: should_alert={ai.get('should_alert')} "
+                f"score={ai.get('score')} min_alert={MIN_AI_SCORE_TO_ALERT}"
+            )
+            if is_auto_source:
+                stat_inc("rejected_before_alert")
+                stat_set(last_mint=mint, last_source=source_type, last_reason=reason)
+                await send_auto_debug_rejection(application, mint, source_type, reason, ai, dex_summary)
             return 0
 
     sent = 0
@@ -727,16 +885,60 @@ async def process_candidate(application: Application, mint: str, source_type: st
 
         trade_result = None
 
-        can_trade = (
-            ai.get("approve_trade")
-            and int(ai.get("score", 0)) >= MIN_AI_SCORE_TO_TRADE
-            and count_recent_trades(telegram_id, 1) < MAX_TRADES_PER_HOUR
-            and count_recent_trades(telegram_id, 24) < MAX_DAILY_TRADES
-            and count_open_trades(telegram_id) < MAX_OPEN_TRADES
-            and not has_trade_for_mint(telegram_id, mint)
+        trades_last_hour = count_recent_trades(telegram_id, 1)
+        trades_last_day = count_recent_trades(telegram_id, 24)
+        open_trades_count = count_open_trades(telegram_id)
+        already_traded_mint = has_trade_for_mint(telegram_id, mint)
+
+        ai_score = int(ai.get("score", 0) or 0)
+        override_allowed = (
+            ALLOW_SCORE_OVERRIDE_FOR_TINY_TEST
+            and ai_score >= MIN_OVERRIDE_SCORE
+            and not ai.get("approve_trade")
         )
+        ai_trade_allowed = bool(ai.get("approve_trade")) or override_allowed
+
+        trade_reasons = []
+        if not ai_trade_allowed:
+            trade_reasons.append(
+                f"AI approve_trade=False and override not allowed "
+                f"(score={ai_score}, MIN_OVERRIDE_SCORE={MIN_OVERRIDE_SCORE}, override={ALLOW_SCORE_OVERRIDE_FOR_TINY_TEST})"
+            )
+
+        # Normal AI-approved trade uses MIN_AI_SCORE_TO_TRADE.
+        # Override trade uses MIN_OVERRIDE_SCORE instead.
+        if ai.get("approve_trade") and ai_score < MIN_AI_SCORE_TO_TRADE:
+            trade_reasons.append(f"AI score {ai.get('score')} < MIN_AI_SCORE_TO_TRADE {MIN_AI_SCORE_TO_TRADE}")
+
+        if override_allowed and ai_score < MIN_OVERRIDE_SCORE:
+            trade_reasons.append(f"override score {ai_score} < MIN_OVERRIDE_SCORE {MIN_OVERRIDE_SCORE}")
+        if trades_last_hour >= MAX_TRADES_PER_HOUR:
+            trade_reasons.append(f"hour limit {trades_last_hour}/{MAX_TRADES_PER_HOUR}")
+        if trades_last_day >= MAX_DAILY_TRADES:
+            trade_reasons.append(f"daily limit {trades_last_day}/{MAX_DAILY_TRADES}")
+        if open_trades_count >= MAX_OPEN_TRADES:
+            trade_reasons.append(f"open limit {open_trades_count}/{MAX_OPEN_TRADES}")
+        if already_traded_mint:
+            trade_reasons.append("already traded this mint")
+
+        can_trade = not trade_reasons
+
+        if is_auto_source and not can_trade:
+            stat_inc("rejected_trade")
+            stat_set(last_mint=mint, last_source=source_type, last_reason="; ".join(trade_reasons))
+            await send_auto_debug_rejection(
+                application,
+                mint,
+                source_type,
+                "trade blocked: " + "; ".join(trade_reasons),
+                ai,
+                dex_summary,
+            )
 
         if can_trade and TRADING_MODE in ["paper", "live"]:
+            if is_auto_source:
+                stat_inc("trade_allowed")
+                stat_set(last_mint=mint, last_source=source_type, last_reason="trade allowed")
             await send_progress(
                 application,
                 progress_chat_id,
@@ -761,6 +963,9 @@ async def process_candidate(application: Application, mint: str, source_type: st
 
             elif live_trading_enabled():
                 try:
+                    if is_auto_source:
+                        stat_inc("buy_attempts")
+                        stat_set(last_mint=mint, last_source=source_type, last_reason="live buy attempt")
                     await send_progress(application, progress_chat_id, "⏳ <b>LIVE BUY</b> Запит до PumpPortal/RPC...")
                     resp = await asyncio.wait_for(asyncio.to_thread(pumpportal_trade, "buy", mint, TRADE_AMOUNT_SOL, True), timeout=25)
                     sig = extract_signature(resp)
@@ -778,7 +983,13 @@ async def process_candidate(application: Application, mint: str, source_type: st
                         "ai_score": ai.get("score"),
                         "source_type": source_type,
                     })
+                    if is_auto_source:
+                        stat_inc("buy_success")
+                        stat_set(last_mint=mint, last_source=source_type, last_reason="live buy success")
                 except Exception as e:
+                    if is_auto_source:
+                        stat_inc("buy_failed")
+                        stat_set(last_mint=mint, last_source=source_type, last_reason=f"buy failed: {e}")
                     trade_result = {
                         "status": "buy_failed",
                         "action": "buy",
@@ -1031,6 +1242,7 @@ Live enabled: <b>{escape(live_trading_enabled())}</b>
 /close_all
 /stats
 /trading_status
+/auto_status
 /wallet
 /alerts_on
 /alerts_off
@@ -1057,6 +1269,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 /close_all — вручну закрити всі відкриті trades
 /stats — статистика тестових trades
 /trading_status — режим і ліміти
+/auto_status — debug авто-торгівлі
 /wallet — public key локального wallet
 
 <b>Modes:</b>
@@ -1293,6 +1506,11 @@ Max trades/hour: {MAX_TRADES_PER_HOUR}
 Max daily trades: {MAX_DAILY_TRADES}
 Max open trades: {MAX_OPEN_TRADES}
 
+MIN_AI_SCORE_TO_ALERT: {MIN_AI_SCORE_TO_ALERT}
+MIN_AI_SCORE_TO_TRADE: {MIN_AI_SCORE_TO_TRADE}
+ALLOW_SCORE_OVERRIDE_FOR_TINY_TEST: {escape(ALLOW_SCORE_OVERRIDE_FOR_TINY_TEST)}
+MIN_OVERRIDE_SCORE: {MIN_OVERRIDE_SCORE}
+
 Local wallet set: {escape(bool(load_local_keypair()))}
 Confirm ok: {escape(TRADING_CONFIRM == "YES_I_UNDERSTAND")}
 Wallet pubkey: {escape(local_wallet_pubkey())}
@@ -1316,6 +1534,63 @@ async def alerts_off_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     set_alerts_enabled(str(chat.id), False)
     await update.message.reply_text("⏸ Alerts off")
 
+
+
+async def auto_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+
+    chat = update.effective_chat
+    telegram_id = str(chat.id) if chat else ""
+
+    trades_hour = count_recent_trades(telegram_id, 1) if telegram_id else 0
+    trades_day = count_recent_trades(telegram_id, 24) if telegram_id else 0
+    open_count = count_open_trades(telegram_id) if telegram_id else 0
+
+    text = f"""
+🤖 <b>Auto trading debug status</b>
+
+<b>Auto enabled:</b>
+ENABLE_PUMPPORTAL_NEW_TOKENS: {escape(ENABLE_PUMPPORTAL_NEW_TOKENS)}
+PROCESS_PUMP_NEW_TOKENS_WITH_AI: {escape(PROCESS_PUMP_NEW_TOKENS_WITH_AI)}
+TRADING_MODE: {escape(TRADING_MODE)}
+Live enabled: {escape(live_trading_enabled())}
+
+<b>Thresholds:</b>
+MIN_AI_SCORE_TO_ALERT: {MIN_AI_SCORE_TO_ALERT}
+MIN_AI_SCORE_TO_TRADE: {MIN_AI_SCORE_TO_TRADE}
+ALLOW_SCORE_OVERRIDE_FOR_TINY_TEST: {escape(ALLOW_SCORE_OVERRIDE_FOR_TINY_TEST)}
+MIN_OVERRIDE_SCORE: {MIN_OVERRIDE_SCORE}
+AUTO_DEBUG_REJECTIONS: {escape(AUTO_DEBUG_REJECTIONS)}
+AUTO_DEBUG_MIN_SCORE: {AUTO_DEBUG_MIN_SCORE}
+
+<b>Limits:</b>
+trades last hour: {trades_hour}/{MAX_TRADES_PER_HOUR}
+trades today: {trades_day}/{MAX_DAILY_TRADES}
+open trades: {open_count}/{MAX_OPEN_TRADES}
+
+<b>Runtime stats since last restart:</b>
+seen: {AUTO_STATS.get("seen")}
+bad name: {AUTO_STATS.get("bad_name")}
+dex checked: {AUTO_STATS.get("dex_checked")}
+AI checked: {AUTO_STATS.get("ai_checked")}
+rejected before alert: {AUTO_STATS.get("rejected_before_alert")}
+rejected trade: {AUTO_STATS.get("rejected_trade")}
+trade allowed: {AUTO_STATS.get("trade_allowed")}
+buy attempts: {AUTO_STATS.get("buy_attempts")}
+buy success: {AUTO_STATS.get("buy_success")}
+buy failed: {AUTO_STATS.get("buy_failed")}
+
+<b>Last:</b>
+mint: <code>{escape(AUTO_STATS.get("last_mint"))}</code>
+source: {escape(AUTO_STATS.get("last_source"))}
+score: {escape(AUTO_STATS.get("last_score"))}
+should_alert: {escape(AUTO_STATS.get("last_should_alert"))}
+approve_trade: {escape(AUTO_STATS.get("last_approve_trade"))}
+reason: {escape(AUTO_STATS.get("last_reason"))}
+time: {escape(AUTO_STATS.get("last_time"))}
+"""
+    await update.message.reply_text(text.strip(), parse_mode=ParseMode.HTML)
 
 
 async def wallet_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1364,6 +1639,7 @@ def main() -> None:
     application.add_handler(CommandHandler("close_all", close_all_command))
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("trading_status", trading_status_command))
+    application.add_handler(CommandHandler("auto_status", auto_status_command))
     application.add_handler(CommandHandler("wallet", wallet_command))
     application.add_handler(CommandHandler("alerts_on", alerts_on_command))
     application.add_handler(CommandHandler("alerts_off", alerts_off_command))
