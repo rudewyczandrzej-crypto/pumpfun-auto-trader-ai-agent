@@ -68,6 +68,10 @@ MIN_AI_SCORE_TO_TRADE = int(os.getenv("MIN_AI_SCORE_TO_TRADE", "7"))
 MIN_AI_SCORE_TO_ALERT = int(os.getenv("MIN_AI_SCORE_TO_ALERT", "6"))
 
 ENABLE_PUMPPORTAL_NEW_TOKENS = os.getenv("ENABLE_PUMPPORTAL_NEW_TOKENS", "true").lower() in ["1", "true", "yes", "y"]
+
+# Safety: Pump.fun new-token stream is extremely noisy.
+# For live/manual tests this must be false, otherwise Telegram commands can feel frozen.
+PROCESS_PUMP_NEW_TOKENS_WITH_AI = os.getenv("PROCESS_PUMP_NEW_TOKENS_WITH_AI", "false").lower() in ["1", "true", "yes", "y"]
 ENABLE_X_RSS = os.getenv("ENABLE_X_RSS", "true").lower() in ["1", "true", "yes", "y"]
 X_RSS_CHECK_INTERVAL_SECONDS = int(os.getenv("X_RSS_CHECK_INTERVAL_SECONDS", "60"))
 TRADE_MANAGE_INTERVAL_SECONDS = int(os.getenv("TRADE_MANAGE_INTERVAL_SECONDS", "15"))
@@ -98,7 +102,7 @@ if not GROQ_API_KEY:
     raise RuntimeError("Missing GROQ_API_KEY")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-groq_client = Groq(api_key=GROQ_API_KEY)
+groq_client = Groq(api_key=GROQ_API_KEY, timeout=25.0)
 
 http = requests.Session()
 http.headers.update({"User-Agent": "PumpFunAutoTraderAI/1.0", "Accept": "application/json,text/plain,*/*"})
@@ -367,7 +371,7 @@ def recent_detected(limit: int = 10) -> List[Dict[str, Any]]:
 def fetch_dexscreener_token(mint: str) -> List[Dict[str, Any]]:
     try:
         url = f"{DEXSCREENER_BASE_URL}/tokens/v1/solana/{mint}"
-        r = http.get(url, timeout=15)
+        r = http.get(url, timeout=8)
         if r.status_code >= 400:
             return []
         data = r.json()
@@ -506,7 +510,7 @@ def pumpportal_trade(action: str, mint: str, amount: Any, denominated_in_sol: bo
         "pool": TRADE_POOL,
     }
 
-    response = http.post(PUMPPORTAL_TRADE_LOCAL_URL, json=body, timeout=30)
+    response = http.post(PUMPPORTAL_TRADE_LOCAL_URL, json=body, timeout=12)
 
     if response.status_code >= 400:
         try:
@@ -539,7 +543,7 @@ def pumpportal_trade(action: str, mint: str, amount: Any, denominated_in_sol: bo
     }
 
     try:
-        rpc_response = http.post(SOLANA_RPC_URL, json=rpc_payload, timeout=30)
+        rpc_response = http.post(SOLANA_RPC_URL, json=rpc_payload, timeout=15)
     except Exception as e:
         raise RuntimeError(f"Solana RPC send failed: {e}")
 
@@ -578,6 +582,20 @@ def extract_signature(resp: Dict[str, Any]) -> Optional[str]:
         if m:
             return m.group(0)
     return None
+
+
+async def send_progress(application: Application, chat_id: Optional[str], text: str) -> None:
+    if not chat_id:
+        return
+    try:
+        await application.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.warning("Could not send progress message: %s", e)
 
 
 # =========================
@@ -661,18 +679,21 @@ Note: {escape(note)}
 # CORE
 # =========================
 
-async def process_candidate(application: Application, mint: str, source_type: str, source_payload: Dict[str, Any], force: bool = False) -> int:
+async def process_candidate(application: Application, mint: str, source_type: str, source_payload: Dict[str, Any], force: bool = False, progress_chat_id: Optional[str] = None) -> int:
     if not mint:
         return 0
 
+    await send_progress(application, progress_chat_id, "🔍 <b>1/5</b> Прийняв mint, починаю перевірку...")
     store_detected_token(mint, source_type, source_payload)
 
     if contains_bad_name(json.dumps(source_payload, ensure_ascii=False)):
         return 0
 
-    pairs = fetch_dexscreener_token(mint)
+    await send_progress(application, progress_chat_id, "📊 <b>2/5</b> Перевіряю DexScreener...")
+    pairs = await asyncio.wait_for(asyncio.to_thread(fetch_dexscreener_token, mint), timeout=10)
     dex_summary = summarize_dex_pairs(pairs)
 
+    await send_progress(application, progress_chat_id, "🤖 <b>3/5</b> Відправляю дані в Groq AI...")
     context = {
         "mint": mint,
         "source_type": source_type,
@@ -683,7 +704,13 @@ async def process_candidate(application: Application, mint: str, source_type: st
         "trading_mode": TRADING_MODE,
     }
 
-    ai = evaluate_candidate_with_ai(context)
+    ai = await asyncio.wait_for(asyncio.to_thread(evaluate_candidate_with_ai, context), timeout=30)
+
+    await send_progress(
+        application,
+        progress_chat_id,
+        f"🧠 <b>AI готовий</b> | score: {escape(ai.get('score'))}/10 | approve_trade: {escape(ai.get('approve_trade'))}"
+    )
 
     if not force:
         if not ai.get("should_alert") or int(ai.get("score", 0)) < MIN_AI_SCORE_TO_ALERT:
@@ -710,6 +737,11 @@ async def process_candidate(application: Application, mint: str, source_type: st
         )
 
         if can_trade and TRADING_MODE in ["paper", "live"]:
+            await send_progress(
+                application,
+                progress_chat_id,
+                f"🟢 <b>4/5</b> AI дозволив trade. Режим: {escape(TRADING_MODE)}. Готую buy..."
+            )
             entry_price = dex_summary.get("price_usd")
             if TRADING_MODE == "paper":
                 trade_result = {
@@ -729,7 +761,8 @@ async def process_candidate(application: Application, mint: str, source_type: st
 
             elif live_trading_enabled():
                 try:
-                    resp = pumpportal_trade("buy", mint, TRADE_AMOUNT_SOL, True)
+                    await send_progress(application, progress_chat_id, "⏳ <b>LIVE BUY</b> Запит до PumpPortal/RPC...")
+                    resp = await asyncio.wait_for(asyncio.to_thread(pumpportal_trade, "buy", mint, TRADE_AMOUNT_SOL, True), timeout=25)
                     sig = extract_signature(resp)
                     trade_result = {
                         "status": "live_open",
@@ -754,6 +787,7 @@ async def process_candidate(application: Application, mint: str, source_type: st
                         "response": {"error": str(e)},
                     }
 
+        await send_progress(application, progress_chat_id, "📨 <b>5/5</b> Надсилаю фінальний результат...")
         msg = format_alert(mint, context, ai, trade_result)
         await application.bot.send_message(
             chat_id=telegram_id,
@@ -809,7 +843,7 @@ async def manage_open_trades(application: Application) -> None:
                     resp = {}
                     if TRADING_MODE == "live" and live_trading_enabled():
                         try:
-                            resp = pumpportal_trade("sell", mint, "100%", False)
+                            resp = await asyncio.wait_for(asyncio.to_thread(pumpportal_trade, "sell", mint, "100%", False), timeout=25)
                         except Exception as e:
                             resp = {"error": str(e)}
                             note += f" | sell failed: {e}"
@@ -829,7 +863,7 @@ async def manage_open_trades(application: Application) -> None:
                     resp = {}
                     if TRADING_MODE == "live" and live_trading_enabled():
                         try:
-                            resp = pumpportal_trade("sell", mint, "100%", False)
+                            resp = await asyncio.wait_for(asyncio.to_thread(pumpportal_trade, "sell", mint, "100%", False), timeout=25)
                         except Exception as e:
                             resp = {"error": str(e)}
                     else:
@@ -1094,9 +1128,39 @@ async def watch_mint_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not SOLANA_ADDRESS_RE.fullmatch(mint):
         await update.message.reply_text("Це не схоже на Solana CA.")
         return
-    sent = await process_candidate(context.application, mint, "manual_watch", {"manual": True, "mint": mint}, force=True)
-    if not sent:
-        await update.message.reply_text("AI не дав alert/trade.")
+    await update.message.reply_text(
+        "✅ Mint прийнято. Запустив перевірку у фоні. Зараз почнуть приходити progress-повідомлення."
+    )
+
+    async def _run_manual_watch() -> None:
+        try:
+            sent = await process_candidate(
+                context.application,
+                mint,
+                "manual_watch",
+                {"manual": True, "mint": mint},
+                force=True,
+                progress_chat_id=str(chat.id),
+            )
+            if not sent:
+                await context.application.bot.send_message(
+                    chat_id=str(chat.id),
+                    text="⚠️ AI не дав alert/trade або фільтри не дозволили.",
+                )
+        except asyncio.TimeoutError:
+            await context.application.bot.send_message(
+                chat_id=str(chat.id),
+                text="⏱ Timeout: один із кроків завис більше дозволеного часу. Дивись Railway logs.",
+            )
+        except Exception as e:
+            logger.error("Manual watch failed: %s", e)
+            await context.application.bot.send_message(
+                chat_id=str(chat.id),
+                text=f"❌ Manual watch error: {escape(e)}",
+                parse_mode=ParseMode.HTML,
+            )
+
+    asyncio.create_task(_run_manual_watch())
 
 
 async def open_trades_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1216,7 +1280,7 @@ async def trading_status_command(update: Update, context: ContextTypes.DEFAULT_T
     text = f"""
 ⚙️ <b>Trading status</b>
 
-TRADING_MODE: <b>{escape(TRADING_MODE)}</b>
+TRADING_MODE: <b>{escape(TRADING_MODE)}</b>\nPROCESS_PUMP_NEW_TOKENS_WITH_AI: <b>{escape(PROCESS_PUMP_NEW_TOKENS_WITH_AI)}</b>
 Live enabled: <b>{escape(live_trading_enabled())}</b>
 
 TRADE_AMOUNT_SOL: {TRADE_AMOUNT_SOL}
@@ -1280,7 +1344,9 @@ Private key ніколи не показується в Telegram.
 # =========================
 
 async def post_init(application: Application) -> None:
-    if ENABLE_PUMPPORTAL_NEW_TOKENS:
+    # Do not start noisy PumpPortal stream unless explicitly enabled for AI processing.
+    # Manual /watch_mint tests work without this listener.
+    if ENABLE_PUMPPORTAL_NEW_TOKENS and PROCESS_PUMP_NEW_TOKENS_WITH_AI:
         asyncio.create_task(pumpportal_listener(application))
 
 
