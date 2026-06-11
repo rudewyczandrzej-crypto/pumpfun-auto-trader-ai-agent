@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import base64
 import html
 import time
 import asyncio
@@ -15,6 +16,9 @@ import websockets
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from groq import Groq
+
+from solders.keypair import Keypair
+from solders.transaction import VersionedTransaction
 
 from telegram import Update
 from telegram.constants import ParseMode
@@ -35,8 +39,9 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant").strip()
 
 PUMPPORTAL_WS_URL = os.getenv("PUMPPORTAL_WS_URL", "wss://pumpportal.fun/api/data").strip()
-PUMPPORTAL_TRADE_URL = os.getenv("PUMPPORTAL_TRADE_URL", "https://pumpportal.fun/api/trade").strip()
-PUMPPORTAL_API_KEY = os.getenv("PUMPPORTAL_API_KEY", "").strip()
+PUMPPORTAL_TRADE_LOCAL_URL = os.getenv("PUMPPORTAL_TRADE_LOCAL_URL", "https://pumpportal.fun/api/trade-local").strip()
+SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com").strip()
+SOLANA_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY", "").strip()
 
 DEXSCREENER_BASE_URL = os.getenv("DEXSCREENER_BASE_URL", "https://api.dexscreener.com").strip().rstrip("/")
 
@@ -162,11 +167,51 @@ def contains_bad_name(text: str) -> bool:
     return any(k in t for k in BAD_NAME_KEYWORDS)
 
 
+_LOCAL_KEYPAIR_CACHE: Optional[Keypair] = None
+
+
+def load_local_keypair() -> Optional[Keypair]:
+    """
+    Load Solana private key from Railway env.
+
+    Supported:
+    - base58 private key
+    - JSON byte array: [1,2,3,...]
+
+    Seed phrase is intentionally not supported.
+    """
+    global _LOCAL_KEYPAIR_CACHE
+
+    if _LOCAL_KEYPAIR_CACHE:
+        return _LOCAL_KEYPAIR_CACHE
+
+    raw = (SOLANA_PRIVATE_KEY or "").strip()
+    if not raw:
+        return None
+
+    try:
+        if raw.startswith("["):
+            arr = json.loads(raw)
+            _LOCAL_KEYPAIR_CACHE = Keypair.from_bytes(bytes(arr))
+        else:
+            _LOCAL_KEYPAIR_CACHE = Keypair.from_base58_string(raw)
+
+        return _LOCAL_KEYPAIR_CACHE
+    except Exception as e:
+        logger.error("Could not load SOLANA_PRIVATE_KEY: %s", e)
+        return None
+
+
+def local_wallet_pubkey() -> Optional[str]:
+    kp = load_local_keypair()
+    return str(kp.pubkey()) if kp else None
+
+
 def live_trading_enabled() -> bool:
     return (
         TRADING_MODE == "live"
         and TRADING_CONFIRM == "YES_I_UNDERSTAND"
-        and bool(PUMPPORTAL_API_KEY)
+        and load_local_keypair() is not None
     )
 
 
@@ -434,15 +479,24 @@ def evaluate_candidate_with_ai(context: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # =========================
-# PUMPPORTAL TRADING
+# PUMPPORTAL LOCAL TRADING
 # =========================
 
 def pumpportal_trade(action: str, mint: str, amount: Any, denominated_in_sol: bool) -> Dict[str, Any]:
-    if not PUMPPORTAL_API_KEY:
-        raise RuntimeError("Missing PUMPPORTAL_API_KEY")
+    """
+    PumpPortal Local Trading API:
+    1. Build unsigned transaction through PumpPortal /api/trade-local.
+    2. Sign locally with SOLANA_PRIVATE_KEY.
+    3. Send signed transaction through SOLANA_RPC_URL using raw JSON-RPC.
 
-    url = f"{PUMPPORTAL_TRADE_URL}?api-key={PUMPPORTAL_API_KEY}"
+    This version does NOT use SOLANA_PRIVATE_KEY and does NOT need solana.py.
+    """
+    keypair = load_local_keypair()
+    if not keypair:
+        raise RuntimeError("Missing or invalid SOLANA_PRIVATE_KEY")
+
     body = {
+        "publicKey": str(keypair.pubkey()),
         "action": action,
         "mint": mint,
         "amount": amount,
@@ -450,19 +504,68 @@ def pumpportal_trade(action: str, mint: str, amount: Any, denominated_in_sol: bo
         "slippage": SLIPPAGE_PERCENT,
         "priorityFee": PRIORITY_FEE_SOL,
         "pool": TRADE_POOL,
-        "skipPreflight": "false",
     }
 
-    r = http.post(url, json=body, timeout=30)
+    response = http.post(PUMPPORTAL_TRADE_LOCAL_URL, json=body, timeout=30)
+
+    if response.status_code >= 400:
+        try:
+            err = response.json()
+        except Exception:
+            err = {"raw": response.text}
+        raise RuntimeError(f"PumpPortal local HTTP {response.status_code}: {err}")
+
     try:
-        data = r.json()
+        unsigned_tx = VersionedTransaction.from_bytes(response.content)
+    except Exception as e:
+        raise RuntimeError(f"Could not decode PumpPortal transaction: {e}. Body: {response.text[:300]}")
+
+    signed_tx = VersionedTransaction(unsigned_tx.message, [keypair])
+    signed_tx_b64 = base64.b64encode(bytes(signed_tx)).decode("utf-8")
+
+    rpc_payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "sendTransaction",
+        "params": [
+            signed_tx_b64,
+            {
+                "encoding": "base64",
+                "skipPreflight": False,
+                "preflightCommitment": "confirmed",
+                "maxRetries": 3,
+            },
+        ],
+    }
+
+    try:
+        rpc_response = http.post(SOLANA_RPC_URL, json=rpc_payload, timeout=30)
+    except Exception as e:
+        raise RuntimeError(f"Solana RPC send failed: {e}")
+
+    try:
+        rpc_data = rpc_response.json()
     except Exception:
-        data = {"raw": r.text}
+        rpc_data = {"raw": rpc_response.text}
 
-    if r.status_code >= 400:
-        raise RuntimeError(f"PumpPortal HTTP {r.status_code}: {data}")
+    if rpc_response.status_code >= 400:
+        raise RuntimeError(f"Solana RPC HTTP {rpc_response.status_code}: {rpc_data}")
 
-    return data
+    if isinstance(rpc_data, dict) and rpc_data.get("error"):
+        raise RuntimeError(f"Solana RPC error: {rpc_data.get('error')}")
+
+    signature = rpc_data.get("result") if isinstance(rpc_data, dict) else None
+
+    return {
+        "signature": signature,
+        "action": action,
+        "mint": mint,
+        "amount": amount,
+        "denominatedInSol": denominated_in_sol,
+        "public_key": str(keypair.pubkey()),
+        "rpc": SOLANA_RPC_URL,
+        "response": rpc_data,
+    }
 
 
 def extract_signature(resp: Dict[str, Any]) -> Optional[str]:
@@ -894,6 +997,7 @@ Live enabled: <b>{escape(live_trading_enabled())}</b>
 /close_all
 /stats
 /trading_status
+/wallet
 /alerts_on
 /alerts_off
 /help
@@ -901,7 +1005,7 @@ Live enabled: <b>{escape(live_trading_enabled())}</b>
 ⚠️ Реальна торгівля можлива тільки якщо:
 TRADING_MODE=live
 TRADING_CONFIRM=YES_I_UNDERSTAND
-PUMPPORTAL_API_KEY заповнений
+SOLANA_PRIVATE_KEY заповнений
 
 Нема підтвердження кожної позиції — це одноразовий env-запобіжник.
 """.strip(), parse_mode=ParseMode.HTML)
@@ -919,11 +1023,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 /close_all — вручну закрити всі відкриті trades
 /stats — статистика тестових trades
 /trading_status — режим і ліміти
+/wallet — public key локального wallet
 
 <b>Modes:</b>
 watch — тільки alerts
 paper — симуляція buy/sell
-live — реальні tiny trades через PumpPortal Lightning API
+live — реальні tiny trades через PumpPortal Local Trading API
 
 Live НЕ питає підтвердження кожної угоди. Підтвердження — тільки Railway env:
 TRADING_CONFIRM=YES_I_UNDERSTAND
@@ -1124,8 +1229,10 @@ Max trades/hour: {MAX_TRADES_PER_HOUR}
 Max daily trades: {MAX_DAILY_TRADES}
 Max open trades: {MAX_OPEN_TRADES}
 
-PumpPortal API key set: {escape(bool(PUMPPORTAL_API_KEY))}
+Local wallet set: {escape(bool(load_local_keypair()))}
 Confirm ok: {escape(TRADING_CONFIRM == "YES_I_UNDERSTAND")}
+Wallet pubkey: {escape(local_wallet_pubkey())}
+RPC: {escape(SOLANA_RPC_URL)}
 """
     await update.message.reply_text(text.strip(), parse_mode=ParseMode.HTML)
 
@@ -1144,6 +1251,28 @@ async def alerts_off_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     set_alerts_enabled(str(chat.id), False)
     await update.message.reply_text("⏸ Alerts off")
+
+
+
+async def wallet_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+
+    pubkey = local_wallet_pubkey()
+    text = f"""
+👛 <b>Local wallet</b>
+
+Loaded: <b>{escape(bool(pubkey))}</b>
+
+Public key:
+<code>{escape(pubkey)}</code>
+
+RPC:
+<code>{escape(SOLANA_RPC_URL)}</code>
+
+Private key ніколи не показується в Telegram.
+"""
+    await update.message.reply_text(text.strip(), parse_mode=ParseMode.HTML)
 
 
 # =========================
@@ -1169,6 +1298,7 @@ def main() -> None:
     application.add_handler(CommandHandler("close_all", close_all_command))
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("trading_status", trading_status_command))
+    application.add_handler(CommandHandler("wallet", wallet_command))
     application.add_handler(CommandHandler("alerts_on", alerts_on_command))
     application.add_handler(CommandHandler("alerts_off", alerts_off_command))
 
