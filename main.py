@@ -8,7 +8,7 @@ import asyncio
 import logging
 import traceback
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import feedparser
@@ -73,6 +73,15 @@ MIN_AI_SCORE_TO_ALERT = int(os.getenv("MIN_AI_SCORE_TO_ALERT", "6"))
 # Score 1-3 should still never be traded.
 ALLOW_SCORE_OVERRIDE_FOR_TINY_TEST = os.getenv("ALLOW_SCORE_OVERRIDE_FOR_TINY_TEST", "false").lower() in ["1", "true", "yes", "y"]
 MIN_OVERRIDE_SCORE = int(os.getenv("MIN_OVERRIDE_SCORE", "5"))
+
+# Transaction-based trigger for very fresh pump.fun tokens.
+# This is more suitable for fast 5-10 minute tests than waiting for "perfect" AI setup.
+TX_TRIGGER_ENABLED = os.getenv("TX_TRIGGER_ENABLED", "true").lower() in ["1", "true", "yes", "y"]
+MIN_TXNS_5M_FOR_TRADE = int(os.getenv("MIN_TXNS_5M_FOR_TRADE", "100"))
+MIN_BUYS_5M_FOR_TRADE = int(os.getenv("MIN_BUYS_5M_FOR_TRADE", "45"))
+MAX_SELL_RATIO_5M = float(os.getenv("MAX_SELL_RATIO_5M", "0.65"))
+MIN_TX_TRIGGER_AI_SCORE = int(os.getenv("MIN_TX_TRIGGER_AI_SCORE", "2"))
+REQUIRE_DEX_DATA_FOR_TX_TRIGGER = os.getenv("REQUIRE_DEX_DATA_FOR_TX_TRIGGER", "true").lower() in ["1", "true", "yes", "y"]
 
 ENABLE_PUMPPORTAL_NEW_TOKENS = os.getenv("ENABLE_PUMPPORTAL_NEW_TOKENS", "true").lower() in ["1", "true", "yes", "y"]
 
@@ -704,6 +713,12 @@ should_alert: {escape(ai.get("should_alert"))}
 approve_trade: {escape(ai.get("approve_trade"))}
 category: {escape(ai.get("category"))}
 
+TX trigger:
+enabled: {escape(TX_TRIGGER_ENABLED)}
+min tx 5m: {escape(MIN_TXNS_5M_FOR_TRADE)}
+min buys 5m: {escape(MIN_BUYS_5M_FOR_TRADE)}
+max sell ratio: {escape(MAX_SELL_RATIO_5M)}
+
 Dex:
 price: {escape(dex_summary.get("price_usd"))}
 liquidity: {escape(dex_summary.get("liquidity_usd"))}
@@ -730,8 +745,63 @@ AI note:
 # FORMAT
 # =========================
 
+
+def get_tx_metrics(dex_summary: Dict[str, Any]) -> Dict[str, Any]:
+    tx = dex_summary.get("txns_5m") or {}
+    buys = int(tx.get("buys") or 0)
+    sells = int(tx.get("sells") or 0)
+    total = buys + sells
+    sell_ratio = (sells / total) if total > 0 else 1.0
+    buy_ratio = (buys / total) if total > 0 else 0.0
+
+    return {
+        "buys_5m": buys,
+        "sells_5m": sells,
+        "total_txns_5m": total,
+        "sell_ratio_5m": sell_ratio,
+        "buy_ratio_5m": buy_ratio,
+    }
+
+
+def tx_trigger_allows_trade(dex_summary: Dict[str, Any], ai: Dict[str, Any]) -> Tuple[bool, str]:
+    if not TX_TRIGGER_ENABLED:
+        return False, "TX trigger disabled"
+
+    if REQUIRE_DEX_DATA_FOR_TX_TRIGGER and not dex_summary.get("has_data"):
+        return False, "no Dex data"
+
+    metrics = get_tx_metrics(dex_summary)
+    total = metrics["total_txns_5m"]
+    buys = metrics["buys_5m"]
+    sell_ratio = metrics["sell_ratio_5m"]
+    ai_score = int(ai.get("score", 0) or 0)
+
+    reasons = []
+
+    if total < MIN_TXNS_5M_FOR_TRADE:
+        reasons.append(f"txns 5m {total} < {MIN_TXNS_5M_FOR_TRADE}")
+
+    if buys < MIN_BUYS_5M_FOR_TRADE:
+        reasons.append(f"buys 5m {buys} < {MIN_BUYS_5M_FOR_TRADE}")
+
+    if sell_ratio > MAX_SELL_RATIO_5M:
+        reasons.append(f"sell ratio {sell_ratio:.2f} > {MAX_SELL_RATIO_5M}")
+
+    if ai_score < MIN_TX_TRIGGER_AI_SCORE:
+        reasons.append(f"AI score {ai_score} < MIN_TX_TRIGGER_AI_SCORE {MIN_TX_TRIGGER_AI_SCORE}")
+
+    if reasons:
+        return False, "; ".join(reasons)
+
+    return True, (
+        f"TX trigger passed: total={total}, buys={buys}, "
+        f"sell_ratio={sell_ratio:.2f}, ai_score={ai_score}"
+    )
+
+
 def format_alert(mint: str, context: Dict[str, Any], ai: Dict[str, Any], trade_result: Optional[Dict[str, Any]] = None) -> str:
     dex = context.get("dex_summary") or {}
+    tx_metrics = get_tx_metrics(dex)
     risks = ai.get("risks") or []
     risks_text = "\n".join([f"• {escape(x)}" for x in risks[:5]]) or "н/д"
 
@@ -772,7 +842,8 @@ Price: {escape(dex.get("price_usd")) or "н/д"}
 Liquidity: {escape(dex.get("liquidity_usd")) or "н/д"}
 FDV: {escape(dex.get("fdv")) or "н/д"}
 Vol 5m: {escape(dex.get("volume_5m")) or "н/д"}
-Tx 5m: {escape((dex.get("txns_5m") or {}).get("buys"))} buys / {escape((dex.get("txns_5m") or {}).get("sells"))} sells
+Tx 5m: {escape(tx_metrics.get("total_txns_5m"))} total | {escape(tx_metrics.get("buys_5m"))} buys / {escape(tx_metrics.get("sells_5m"))} sells
+Sell ratio 5m: {escape(round(tx_metrics.get("sell_ratio_5m", 0), 2))}
 
 <b>AI summary:</b>
 {escape(ai.get("summary_uk"))}
@@ -891,27 +962,38 @@ async def process_candidate(application: Application, mint: str, source_type: st
         already_traded_mint = has_trade_for_mint(telegram_id, mint)
 
         ai_score = int(ai.get("score", 0) or 0)
+
         override_allowed = (
             ALLOW_SCORE_OVERRIDE_FOR_TINY_TEST
             and ai_score >= MIN_OVERRIDE_SCORE
             and not ai.get("approve_trade")
         )
-        ai_trade_allowed = bool(ai.get("approve_trade")) or override_allowed
+
+        tx_allowed, tx_reason = tx_trigger_allows_trade(dex_summary, ai)
+
+        ai_trade_allowed = bool(ai.get("approve_trade")) or override_allowed or tx_allowed
 
         trade_reasons = []
         if not ai_trade_allowed:
             trade_reasons.append(
-                f"AI approve_trade=False and override not allowed "
-                f"(score={ai_score}, MIN_OVERRIDE_SCORE={MIN_OVERRIDE_SCORE}, override={ALLOW_SCORE_OVERRIDE_FOR_TINY_TEST})"
+                f"AI/override/TX all blocked | "
+                f"approve_trade={ai.get('approve_trade')} "
+                f"score={ai_score} "
+                f"override={override_allowed} "
+                f"tx_allowed={tx_allowed} ({tx_reason})"
             )
 
         # Normal AI-approved trade uses MIN_AI_SCORE_TO_TRADE.
-        # Override trade uses MIN_OVERRIDE_SCORE instead.
+        # Override trade uses MIN_OVERRIDE_SCORE.
+        # TX trigger uses transaction conditions and MIN_TX_TRIGGER_AI_SCORE.
         if ai.get("approve_trade") and ai_score < MIN_AI_SCORE_TO_TRADE:
             trade_reasons.append(f"AI score {ai.get('score')} < MIN_AI_SCORE_TO_TRADE {MIN_AI_SCORE_TO_TRADE}")
 
         if override_allowed and ai_score < MIN_OVERRIDE_SCORE:
             trade_reasons.append(f"override score {ai_score} < MIN_OVERRIDE_SCORE {MIN_OVERRIDE_SCORE}")
+
+        if tx_allowed:
+            stat_set(last_reason=tx_reason)
         if trades_last_hour >= MAX_TRADES_PER_HOUR:
             trade_reasons.append(f"hour limit {trades_last_hour}/{MAX_TRADES_PER_HOUR}")
         if trades_last_day >= MAX_DAILY_TRADES:
@@ -1511,6 +1593,12 @@ MIN_AI_SCORE_TO_TRADE: {MIN_AI_SCORE_TO_TRADE}
 ALLOW_SCORE_OVERRIDE_FOR_TINY_TEST: {escape(ALLOW_SCORE_OVERRIDE_FOR_TINY_TEST)}
 MIN_OVERRIDE_SCORE: {MIN_OVERRIDE_SCORE}
 
+TX_TRIGGER_ENABLED: {escape(TX_TRIGGER_ENABLED)}
+MIN_TXNS_5M_FOR_TRADE: {MIN_TXNS_5M_FOR_TRADE}
+MIN_BUYS_5M_FOR_TRADE: {MIN_BUYS_5M_FOR_TRADE}
+MAX_SELL_RATIO_5M: {MAX_SELL_RATIO_5M}
+MIN_TX_TRIGGER_AI_SCORE: {MIN_TX_TRIGGER_AI_SCORE}
+
 Local wallet set: {escape(bool(load_local_keypair()))}
 Confirm ok: {escape(TRADING_CONFIRM == "YES_I_UNDERSTAND")}
 Wallet pubkey: {escape(local_wallet_pubkey())}
@@ -1561,6 +1649,19 @@ MIN_AI_SCORE_TO_ALERT: {MIN_AI_SCORE_TO_ALERT}
 MIN_AI_SCORE_TO_TRADE: {MIN_AI_SCORE_TO_TRADE}
 ALLOW_SCORE_OVERRIDE_FOR_TINY_TEST: {escape(ALLOW_SCORE_OVERRIDE_FOR_TINY_TEST)}
 MIN_OVERRIDE_SCORE: {MIN_OVERRIDE_SCORE}
+
+TX_TRIGGER_ENABLED: {escape(TX_TRIGGER_ENABLED)}
+MIN_TXNS_5M_FOR_TRADE: {MIN_TXNS_5M_FOR_TRADE}
+MIN_BUYS_5M_FOR_TRADE: {MIN_BUYS_5M_FOR_TRADE}
+MAX_SELL_RATIO_5M: {MAX_SELL_RATIO_5M}
+MIN_TX_TRIGGER_AI_SCORE: {MIN_TX_TRIGGER_AI_SCORE}
+
+TX_TRIGGER_ENABLED: {escape(TX_TRIGGER_ENABLED)}
+MIN_TXNS_5M_FOR_TRADE: {MIN_TXNS_5M_FOR_TRADE}
+MIN_BUYS_5M_FOR_TRADE: {MIN_BUYS_5M_FOR_TRADE}
+MAX_SELL_RATIO_5M: {MAX_SELL_RATIO_5M}
+MIN_TX_TRIGGER_AI_SCORE: {MIN_TX_TRIGGER_AI_SCORE}
+
 AUTO_DEBUG_REJECTIONS: {escape(AUTO_DEBUG_REJECTIONS)}
 AUTO_DEBUG_MIN_SCORE: {AUTO_DEBUG_MIN_SCORE}
 
